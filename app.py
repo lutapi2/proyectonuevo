@@ -3,6 +3,7 @@ import logging
 import mimetypes
 import os
 import re
+import secrets
 import sqlite3
 import threading
 import time
@@ -11,6 +12,7 @@ from collections import defaultdict, deque
 from contextlib import contextmanager
 from email import policy
 from email.parser import BytesParser
+from http.cookies import CookieError, SimpleCookie
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -32,6 +34,16 @@ UPLOAD_WINDOW_SECONDS = 60 * 60
 UPLOAD_MAX_PER_WINDOW = 10
 UPLOADS_BY_IP = defaultdict(deque)
 UPLOADS_LOCK = threading.Lock()
+ADMIN_PASSWORD = os.environ.get("BETANA_ADMIN_PASSWORD")
+SESSION_COOKIE = "betana_admin"
+SESSION_TTL_SECONDS = 12 * 60 * 60
+LOGIN_WINDOW_SECONDS = 15 * 60
+LOGIN_MAX_ATTEMPTS = 5
+LOGIN_ATTEMPTS_BY_IP = defaultdict(deque)
+LOGIN_ATTEMPTS_LOCK = threading.Lock()
+ADMIN_SESSIONS = {}
+ADMIN_SESSIONS_LOCK = threading.Lock()
+COOKIE_SECURE = os.environ.get("BETANA_COOKIE_SECURE", "false").lower() == "true"
 IMAGE_SIGNATURES = (
     (b"\x89PNG\r\n\x1a\n", ".png"),
     (b"\xff\xd8\xff", ".jpg"),
@@ -212,11 +224,24 @@ class BetanaHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_json_with_cookie(self, status, data, cookie):
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Set-Cookie", cookie)
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
         path = unquote(urlsplit(self.path).path)
         try:
             if path == "/api/products":
                 self.send_json(HTTPStatus.OK, product_list())
+                return
+            if path == "/api/session":
+                self.send_json(HTTPStatus.OK, {"authenticated": self.has_admin_session()})
                 return
             self.serve_file(path)
         except ApiError as error:
@@ -227,17 +252,102 @@ class BetanaHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = unquote(urlsplit(self.path).path)
-        if path != "/api/products":
+        if path not in ("/api/products", "/api/login", "/api/logout"):
             self.send_json(HTTPStatus.NOT_FOUND, {"error": "Ruta no encontrada."})
             return
 
         try:
-            self.add_product()
+            if path == "/api/login":
+                self.login()
+            elif path == "/api/logout":
+                self.logout()
+            else:
+                self.require_admin()
+                self.add_product()
         except ApiError as error:
             self.send_json(error.status, {"error": error.message})
         except (OSError, sqlite3.Error):
-            logging.exception("No se pudo guardar el producto.")
-            self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "No se pudo guardar el producto."})
+            logging.exception("No se pudo procesar la solicitud POST %s", path)
+            self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "No se pudo procesar la solicitud."})
+
+    def has_admin_session(self):
+        cookie = SimpleCookie()
+        try:
+            cookie.load(self.headers.get("Cookie", ""))
+        except CookieError:
+            return False
+        morsel = cookie.get(SESSION_COOKIE)
+        if morsel is None:
+            return False
+
+        token = morsel.value
+        now = time.time()
+        with ADMIN_SESSIONS_LOCK:
+            expires_at = ADMIN_SESSIONS.get(token)
+            if expires_at is None:
+                return False
+            if expires_at <= now:
+                del ADMIN_SESSIONS[token]
+                return False
+            return True
+
+    def require_admin(self):
+        if not self.has_admin_session():
+            raise ApiError(HTTPStatus.UNAUTHORIZED, "Inicia sesión como administrador para añadir productos.")
+
+    def login(self):
+        content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
+            raise ApiError(HTTPStatus.BAD_REQUEST, "La solicitud de acceso no tiene un formato válido.")
+        try:
+            data = json.loads(self.read_body(4096))
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "La solicitud de acceso no tiene un formato válido.") from error
+        password = data.get("password") if isinstance(data, dict) else None
+        if not isinstance(password, str):
+            raise ApiError(HTTPStatus.BAD_REQUEST, "Escribe la clave de administrador.")
+
+        client_ip = self.client_address[0]
+        now = time.monotonic()
+        with LOGIN_ATTEMPTS_LOCK:
+            attempts = LOGIN_ATTEMPTS_BY_IP[client_ip]
+            while attempts and now - attempts[0] >= LOGIN_WINDOW_SECONDS:
+                attempts.popleft()
+            if len(attempts) >= LOGIN_MAX_ATTEMPTS:
+                raise ApiError(HTTPStatus.TOO_MANY_REQUESTS, "Demasiados intentos. Espera 15 minutos para volver a intentar.")
+
+        if ADMIN_PASSWORD is None or not secrets.compare_digest(password, ADMIN_PASSWORD):
+            with LOGIN_ATTEMPTS_LOCK:
+                LOGIN_ATTEMPTS_BY_IP[client_ip].append(now)
+            raise ApiError(HTTPStatus.UNAUTHORIZED, "La clave de administrador es incorrecta.")
+
+        with LOGIN_ATTEMPTS_LOCK:
+            LOGIN_ATTEMPTS_BY_IP.pop(client_ip, None)
+        token = secrets.token_urlsafe(32)
+        with ADMIN_SESSIONS_LOCK:
+            for existing_token, expires_at in list(ADMIN_SESSIONS.items()):
+                if expires_at <= time.time():
+                    del ADMIN_SESSIONS[existing_token]
+            ADMIN_SESSIONS[token] = time.time() + SESSION_TTL_SECONDS
+        cookie = f"{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_TTL_SECONDS}"
+        if COOKIE_SECURE:
+            cookie += "; Secure"
+        self.send_json_with_cookie(HTTPStatus.OK, {"authenticated": True}, cookie)
+
+    def logout(self):
+        cookie = SimpleCookie()
+        try:
+            cookie.load(self.headers.get("Cookie", ""))
+        except CookieError:
+            cookie = SimpleCookie()
+        morsel = cookie.get(SESSION_COOKIE)
+        if morsel is not None:
+            with ADMIN_SESSIONS_LOCK:
+                ADMIN_SESSIONS.pop(morsel.value, None)
+        expired_cookie = f"{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"
+        if COOKIE_SECURE:
+            expired_cookie += "; Secure"
+        self.send_json_with_cookie(HTTPStatus.OK, {"authenticated": False}, expired_cookie)
 
     def do_PUT(self):
         self.reject_catalog_write()
@@ -246,7 +356,25 @@ class BetanaHandler(BaseHTTPRequestHandler):
         self.reject_catalog_write()
 
     def do_DELETE(self):
-        self.reject_catalog_write()
+        path = unquote(urlsplit(self.path).path)
+        match = re.fullmatch(r"/api/products/([1-9][0-9]{0,18})", path)
+        if match is None:
+            self.reject_catalog_write()
+            return
+
+        product_id = int(match.group(1))
+        if product_id > 9_223_372_036_854_775_807:
+            self.send_json(HTTPStatus.NOT_FOUND, {"error": "Artículo no encontrado."})
+            return
+
+        try:
+            self.require_admin()
+            self.delete_product(product_id)
+        except ApiError as error:
+            self.send_json(error.status, {"error": error.message})
+        except (OSError, sqlite3.Error):
+            logging.exception("No se pudo eliminar el artículo %s.", product_id)
+            self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "No se pudo eliminar el artículo."})
 
     def reject_catalog_write(self):
         self.send_json(HTTPStatus.METHOD_NOT_ALLOWED, {"error": "Esta acción no está permitida."})
@@ -321,6 +449,28 @@ class BetanaHandler(BaseHTTPRequestHandler):
 
         self.send_json(HTTPStatus.CREATED, product_list())
 
+    def delete_product(self, product_id):
+        with database() as connection:
+            product = connection.execute(
+                "SELECT img FROM products WHERE id = ?", (product_id,)
+            ).fetchone()
+            if product is None:
+                raise ApiError(HTTPStatus.NOT_FOUND, "Artículo no encontrado.")
+            connection.execute("DELETE FROM products WHERE id = ?", (product_id,))
+
+        warning = None
+        image_url = product["img"]
+        if image_url.startswith("/uploads/"):
+            filename = image_url[len("/uploads/"):]
+            if Path(filename).name == filename:
+                try:
+                    (UPLOAD_DIR / filename).unlink(missing_ok=True)
+                except OSError:
+                    logging.exception("El artículo %s se eliminó, pero no se pudo borrar su imagen.", product_id)
+                    warning = "El artículo se eliminó, pero no se pudo borrar su archivo de imagen."
+
+        self.send_json(HTTPStatus.OK, {"products": product_list(), "warning": warning})
+
     def serve_file(self, url_path):
         if url_path == "/":
             url_path = "/index.html"
@@ -358,6 +508,8 @@ class BetanaHandler(BaseHTTPRequestHandler):
 
 
 def main():
+    if not ADMIN_PASSWORD:
+        raise RuntimeError("Configura BETANA_ADMIN_PASSWORD antes de iniciar BETANA.")
     initialize_database()
     port = int(os.environ.get("PORT", "8000"))
     host = os.environ.get("HOST", "0.0.0.0")

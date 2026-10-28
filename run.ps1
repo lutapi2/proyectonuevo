@@ -1,5 +1,9 @@
 $ErrorActionPreference = 'Stop'
 
+if (-not $env:BETANA_ADMIN_PASSWORD) {
+    $env:BETANA_ADMIN_PASSWORD = '1234567890'
+}
+
 try {
     python --version
     if ($LASTEXITCODE -ne 0) {
